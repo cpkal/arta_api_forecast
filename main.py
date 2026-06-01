@@ -14,6 +14,7 @@ Struktur folder model (taruh semua di ./models/):
 
 import json
 import os
+import uuid
 from datetime import timedelta
 from typing import Dict, List, Optional
 
@@ -144,6 +145,16 @@ class ForecastRequest(BaseModel):
     history: List[CashflowRow]  # minimal window_size baris (default 90)
 
 
+class UnseenForecastRequest(BaseModel):
+    """
+    Request untuk perusahaan baru / tidak dikenal.
+    Tidak memerlukan company_id — cukup kirim 90 hari history mentah.
+    company_label opsional untuk keperluan identifikasi di response saja.
+    """
+    history: List[CashflowRow]          # minimal window_size baris (default 90)
+    company_label: Optional[str] = None # bebas diisi, tidak dipakai model
+
+
 class DayPrediction(BaseModel):
     date: str
     predicted_net: float
@@ -156,44 +167,62 @@ class ForecastResponse(BaseModel):
     predictions: List[DayPrediction]
 
 
+class UnseenForecastResponse(BaseModel):
+    company_label: str          # label yang dikirim, atau UUID jika kosong
+    sector: str
+    last_known_date: str
+    window_used: int            # berapa hari terakhir yang benar-benar dipakai model
+    predictions: List[DayPrediction]
+
+
 # ---------------------------------------------------------------------------
-# Helper: jalankan prediksi (sama persis dengan notebook)
+# Helper: core inference logic (dipakai oleh kedua endpoint)
 # ---------------------------------------------------------------------------
 
-def predict(sector: str, request: ForecastRequest) -> ForecastResponse:
+def _run_inference(
+    sector: str,
+    history_df: pd.DataFrame,
+) -> tuple[list[DayPrediction], str, int]:
+    """
+    Jalankan prediksi dari DataFrame history yang sudah bersih.
+
+    Returns
+    -------
+    predictions : list[DayPrediction]
+    last_known_date : str  "YYYY-MM-DD"
+    window_used : int
+    """
     entry          = MODELS[sector]
     model          = entry["model"]
     scaler         = entry["scaler"]
     meta           = entry["meta"]
-    feature_cols   = meta["feature_cols"]
-    target_col     = meta["target_col"]
-    window_size    = meta["window_size"]
-    forecast_steps = meta["forecast_steps"]
+    feature_cols   = meta["feature_cols"]   # ['expense', 'income', 'net']
+    target_col     = meta["target_col"]     # 'net'
+    window_size    = meta["window_size"]    # 90
+    forecast_steps = meta["forecast_steps"] # 7
     target_idx     = feature_cols.index(target_col)
 
-    # Bangun DataFrame & sort by date
-    df = pd.DataFrame([r.model_dump() for r in request.history])
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-
-    if len(df) < window_size:
+    if len(history_df) < window_size:
         raise HTTPException(
             status_code=422,
-            detail=f"Butuh minimal {window_size} baris history, hanya ada {len(df)}."
+            detail=(
+                f"Butuh minimal {window_size} baris history, "
+                f"hanya ada {len(history_df)}."
+            ),
         )
 
-    # Scale → predict → inverse transform (mirror notebook Cell 14)
-    last_window        = df[feature_cols].values[-window_size:].astype(np.float32)
+    # Ambil window_size baris terakhir → scale → predict → inverse transform
+    last_window        = history_df[feature_cols].values[-window_size:].astype(np.float32)
     last_window_scaled = scaler.transform(last_window)
 
-    X           = last_window_scaled[np.newaxis, ...]    # (1, window, features)
-    pred_scaled = model.predict(X, verbose=0)[0]         # (forecast_steps,)
+    X           = last_window_scaled[np.newaxis, ...]   # (1, window, features)
+    pred_scaled = model.predict(X, verbose=0)[0]        # (forecast_steps,)
 
     dummy = np.zeros((forecast_steps, len(feature_cols)), dtype=np.float32)
     dummy[:, target_idx] = pred_scaled
     pred_rupiah = scaler.inverse_transform(dummy)[:, target_idx]
 
-    last_date = df["date"].max()
+    last_date = history_df["date"].max()
     predictions = [
         DayPrediction(
             date=(last_date + timedelta(days=i + 1)).strftime("%Y-%m-%d"),
@@ -202,12 +231,15 @@ def predict(sector: str, request: ForecastRequest) -> ForecastResponse:
         for i in range(forecast_steps)
     ]
 
-    return ForecastResponse(
-        company_id=request.company_id,
-        sector=sector,
-        last_known_date=last_date.strftime("%Y-%m-%d"),
-        predictions=predictions,
-    )
+    return predictions, last_date.strftime("%Y-%m-%d"), window_size
+
+
+def _build_history_df(history: List[CashflowRow]) -> pd.DataFrame:
+    """Parse, sort, dan validasi kolom history rows."""
+    df = pd.DataFrame([r.model_dump() for r in history])
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -235,13 +267,63 @@ def list_models():
 
 @app.post("/forecast/{sector}", response_model=ForecastResponse)
 def forecast(sector: str, body: ForecastRequest):
+    """
+    Forecast untuk perusahaan yang ada di training data.
+    company_id dikirim sebagai label saja — tidak mempengaruhi prediksi.
+    """
     if sector not in MODELS:
         raise HTTPException(
             status_code=404,
             detail={"error": f"Sektor '{sector}' tidak ditemukan.",
                     "tersedia": list(MODELS.keys())}
         )
-    return predict(sector, body)
+
+    history_df = _build_history_df(body.history)
+    predictions, last_known_date, _ = _run_inference(sector, history_df)
+
+    return ForecastResponse(
+        company_id=body.company_id,
+        sector=sector,
+        last_known_date=last_known_date,
+        predictions=predictions,
+    )
+
+
+@app.post("/forecast/{sector}/unseen", response_model=UnseenForecastResponse)
+def forecast_unseen(sector: str, body: UnseenForecastRequest):
+    """
+    Forecast untuk perusahaan BARU / tidak dikenal (zero-shot).
+
+    Tidak memerlukan company_id karena model tidak pernah menggunakan
+    identitas perusahaan sebagai fitur — hanya pola time-series 90 hari
+    terakhir (expense, income, net) yang dibutuhkan.
+
+    Tips penggunaan:
+    - Kirim minimal 90 hari data cashflow perusahaan baru.
+    - Isi `company_label` untuk identifikasi di response (opsional).
+    - Kualitas prediksi bergantung pada seberapa mirip pola perusahaan
+      baru dengan distribusi training data sektor ini.
+    """
+    if sector not in MODELS:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"Sektor '{sector}' tidak ditemukan.",
+                    "tersedia": list(MODELS.keys())}
+        )
+
+    history_df = _build_history_df(body.history)
+    predictions, last_known_date, window_used = _run_inference(sector, history_df)
+
+    # Gunakan label yang dikirim, atau generate UUID sebagai fallback
+    label = body.company_label or f"unseen-{uuid.uuid4().hex[:8]}"
+
+    return UnseenForecastResponse(
+        company_label=label,
+        sector=sector,
+        last_known_date=last_known_date,
+        window_used=window_used,
+        predictions=predictions,
+    )
 
 
 @app.post("/models/{sector}/reload")
