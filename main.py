@@ -22,7 +22,47 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import tensorflow as tf
 from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.saving import register_keras_serializable
+
+# ---------------------------------------------------------------------------
+# Custom Layer — harus didefinisikan SEBELUM load_model dipanggil
+# Salin persis dari notebook supaya Keras bisa deserialize model
+# ---------------------------------------------------------------------------
+
+@register_keras_serializable()
+class FinancialNormalizationLayer(layers.Layer):
+    """
+    Custom Layer dari notebook — wajib ada di sini agar model bisa di-load.
+    Melakukan Layer Normalization + scaling adaptif per fitur.
+    """
+
+    def __init__(self, epsilon: float = 1e-6, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+
+    def build(self, input_shape):
+        n_features = input_shape[-1]
+        self.gamma = self.add_weight(
+            name="gamma", shape=(n_features,), initializer="ones", trainable=True
+        )
+        self.beta = self.add_weight(
+            name="beta", shape=(n_features,), initializer="zeros", trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        mean, variance = tf.nn.moments(x, axes=[-1], keepdims=True)
+        x_norm = (x - mean) / tf.sqrt(variance + self.epsilon)
+        return self.gamma * x_norm + self.beta
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"epsilon": self.epsilon})
+        return config
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -43,7 +83,6 @@ def load_all_models():
         print(f"[WARN] MODEL_DIR '{MODEL_DIR}' tidak ditemukan, tidak ada model yang di-load.")
         return
 
-    # Cari semua file *_metadata.json untuk tahu sektor apa saja yang tersedia
     for fname in os.listdir(MODEL_DIR):
         if not fname.endswith("_metadata.json"):
             continue
@@ -53,7 +92,6 @@ def load_all_models():
         scaler_path = os.path.join(MODEL_DIR, f"{sector}_scaler.pkl")
         meta_path   = os.path.join(MODEL_DIR, fname)
 
-        # Skip kalau salah satu file tidak ada
         missing = [p for p in [model_path, scaler_path, meta_path] if not os.path.exists(p)]
         if missing:
             print(f"[SKIP] Sektor '{sector}': file tidak lengkap → {missing}")
@@ -63,8 +101,12 @@ def load_all_models():
             with open(meta_path) as f:
                 meta = json.load(f)
 
+            # custom_objects memastikan FinancialNormalizationLayer dikenali
             MODELS[sector] = {
-                "model":  keras.models.load_model(model_path),
+                "model":  keras.models.load_model(
+                    model_path,
+                    custom_objects={"FinancialNormalizationLayer": FinancialNormalizationLayer}
+                ),
                 "scaler": joblib.load(scaler_path),
                 "meta":   meta,
             }
@@ -119,15 +161,15 @@ class ForecastResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def predict(sector: str, request: ForecastRequest) -> ForecastResponse:
-    entry        = MODELS[sector]
-    model        = entry["model"]
-    scaler       = entry["scaler"]
-    meta         = entry["meta"]
-    feature_cols = meta["feature_cols"]
-    target_col   = meta["target_col"]
-    window_size  = meta["window_size"]
+    entry          = MODELS[sector]
+    model          = entry["model"]
+    scaler         = entry["scaler"]
+    meta           = entry["meta"]
+    feature_cols   = meta["feature_cols"]
+    target_col     = meta["target_col"]
+    window_size    = meta["window_size"]
     forecast_steps = meta["forecast_steps"]
-    target_idx   = feature_cols.index(target_col)
+    target_idx     = feature_cols.index(target_col)
 
     # Bangun DataFrame & sort by date
     df = pd.DataFrame([r.model_dump() for r in request.history])
@@ -144,8 +186,8 @@ def predict(sector: str, request: ForecastRequest) -> ForecastResponse:
     last_window        = df[feature_cols].values[-window_size:].astype(np.float32)
     last_window_scaled = scaler.transform(last_window)
 
-    X           = last_window_scaled[np.newaxis, ...]        # (1, window, features)
-    pred_scaled = model.predict(X, verbose=0)[0]             # (forecast_steps,)
+    X           = last_window_scaled[np.newaxis, ...]    # (1, window, features)
+    pred_scaled = model.predict(X, verbose=0)[0]         # (forecast_steps,)
 
     dummy = np.zeros((forecast_steps, len(feature_cols)), dtype=np.float32)
     dummy[:, target_idx] = pred_scaled
@@ -211,13 +253,16 @@ def reload_model(sector: str):
 
     missing = [p for p in [model_path, scaler_path, meta_path] if not os.path.exists(p)]
     if missing:
-        raise HTTPException(status_code=404,
-                            detail=f"File tidak ditemukan: {missing}")
+        raise HTTPException(status_code=404, detail=f"File tidak ditemukan: {missing}")
+
     try:
         with open(meta_path) as f:
             meta = json.load(f)
         MODELS[sector] = {
-            "model":  keras.models.load_model(model_path),
+            "model":  keras.models.load_model(
+                model_path,
+                custom_objects={"FinancialNormalizationLayer": FinancialNormalizationLayer}
+            ),
             "scaler": joblib.load(scaler_path),
             "meta":   meta,
         }
